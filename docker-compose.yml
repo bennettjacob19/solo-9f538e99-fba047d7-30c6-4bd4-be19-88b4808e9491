@@ -1,0 +1,7 @@
+services:
+  unpacker:
+    build: .
+    image: oci-unpacker:latest
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
