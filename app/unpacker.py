@@ -188,8 +188,12 @@ def _prepare_layer(blob_path, media_type, expected_diff_id, workdir, index):
     return tar_path
 
 
-def load_and_verify(layout_dir, workdir):
-    """Verify the whole layout; return ordered list of plain layer tar paths."""
+def verify_layout(layout_dir, workdir):
+    """Verify the whole layout.
+
+    Returns ``(tar_paths, config)`` -- the ordered list of plain
+    (decompressed) layer tar paths and the parsed image config.
+    """
     _read_json(os.path.join(layout_dir, "oci-layout"), "oci-layout")
     index = _read_json(os.path.join(layout_dir, "index.json"), "index.json")
     manifests = index.get("manifests") if isinstance(index, dict) else None
@@ -239,6 +243,12 @@ def load_and_verify(layout_dir, workdir):
         tar_paths.append(
             _prepare_layer(lpath, ldesc.get("mediaType"), diff_ids[i], workdir, i)
         )
+    return tar_paths, config
+
+
+def load_and_verify(layout_dir, workdir):
+    """Verify the whole layout; return ordered list of plain layer tar paths."""
+    tar_paths, _config = verify_layout(layout_dir, workdir)
     return tar_paths
 
 
@@ -499,7 +509,7 @@ def _apply_deferred_dir_meta(dir_meta):
 # ---------------------------------------------------------------------------
 
 
-def _tar_add(tf, rootfs, rel, inode_map):
+def _tar_add(tf, rootfs, rel, inode_map, pending):
     full = os.path.join(rootfs, rel)
     st = os.lstat(full)
     ti = tarfile.TarInfo(rel)
@@ -511,24 +521,37 @@ def _tar_add(tf, rootfs, rel, inode_map):
         ti.type = tarfile.DIRTYPE
         tf.addfile(ti)
         for child in sorted(os.listdir(full)):
-            _tar_add(tf, rootfs, rel + "/" + child, inode_map)
+            _tar_add(tf, rootfs, rel + "/" + child, inode_map, pending)
     elif stat.S_ISLNK(st.st_mode):
         ti.type = tarfile.SYMTYPE
         ti.linkname = os.readlink(full)
         tf.addfile(ti)
     elif stat.S_ISREG(st.st_mode):
         key = (st.st_dev, st.st_ino)
-        if st.st_nlink > 1 and key in inode_map:
+        if key in inode_map:
+            # An earlier member of this hardlink group was emitted as a
+            # regular file: reference it instead of duplicating the bytes.
             ti.type = tarfile.LNKTYPE
             ti.linkname = inode_map[key]
             tf.addfile(ti)
+        elif st.st_nlink > 1 and key in pending:
+            # The anchor (the group's first path in traversal order) has
+            # not been written yet: park this member and emit it afterwards.
+            pending[key].append((ti, None))
         else:
+            # First (or only) name for this inode: emit the payload once
+            # and remember the member so the rest of the group links here.
+            inode_map[key] = rel
             if st.st_nlink > 1:
-                inode_map[key] = rel
+                pending.setdefault(key, [])
             ti.type = tarfile.REGTYPE
             ti.size = st.st_size
             with open(full, "rb") as f:
                 tf.addfile(ti, f)
+            # Flush any group members that were traversed before the anchor.
+            for link_ti, _ in pending.pop(key, []):
+                link_ti.linkname = rel
+                tf.addfile(link_ti)
     elif stat.S_ISFIFO(st.st_mode):
         ti.type = tarfile.FIFOTYPE
         tf.addfile(ti)
@@ -549,8 +572,13 @@ def _tar_add(tf, rootfs, rel, inode_map):
 def build_rootfs_tar(rootfs, out_path):
     tmp = out_path + ".tmp"
     with tarfile.open(tmp, "w", format=tarfile.PAX_FORMAT) as tf:
+        # inode_map: inode -> anchor relpath; pending: inode -> hardlink
+        # members traversed before their anchor.
+        inode_map, pending = {}, {}
         for child in sorted(os.listdir(rootfs)):
-            _tar_add(tf, rootfs, child, {})
+            _tar_add(tf, rootfs, child, inode_map, pending)
+        if pending:
+            raise UnpackError("internal error: unresolved hardlink anchors")
     os.replace(tmp, out_path)
 
 

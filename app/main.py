@@ -13,6 +13,7 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from starlette.background import BackgroundTask
 
+from .differ import DifferError, make_diff_layer
 from .sample_image import build_sample_image
 from .unpacker import CHUNK, UnpackError, unpack_image
 
@@ -48,7 +49,11 @@ app = FastAPI(
         "* hardlink overwrite is byte-safe for the other end;\n"
         "* paths and links can never escape the per-request sandbox;\n"
         "* any missing/corrupt/illegal input fails the whole request.\n\n"
-        "Try it: download `GET /sample-image`, then upload it to `POST /unpack`."
+        "Try it: download `GET /sample-image`, then upload it to `POST /unpack`.\n\n"
+        "`POST /diff` takes an old and a target image (same platform, both "
+        "single-manifest OCI Image Layout tars) and returns an uncompressed "
+        "appendable layer that turns the old tree into the target tree, "
+        "verified by a trial overlay before the response is sent."
     ),
     lifespan=lifespan,
 )
@@ -61,6 +66,7 @@ def root():
         "docs": "/docs",
         "endpoints": {
             "unpack": "POST /unpack",
+            "diff": "POST /diff",
             "sample_image": "GET /sample-image",
             "healthz": "GET /healthz",
         },
@@ -123,5 +129,56 @@ def unpack(
         rootfs_tar,
         media_type="application/x-tar",
         filename="rootfs.tar",
+        background=BackgroundTask(partial(shutil.rmtree, work, ignore_errors=True)),
+    )
+
+
+@app.post(
+    "/diff",
+    summary="Build an appendable uncompressed OCI diff layer between two images",
+    response_description=(
+        "diff-layer.tar -- an uncompressed OCI layer tar that, appended to the "
+        "old image, reproduces the target image's file tree"
+    ),
+    responses={
+        200: {"content": {"application/x-tar": {}}},
+        400: {
+            "description": "Verification, diff generation or trial overlay "
+            "failure -- no layer is returned."
+        },
+    },
+)
+def diff(
+    old_image: UploadFile = File(
+        ...,
+        description="Old single-manifest OCI Image Layout tar (already present "
+        "on the isolated network)",
+    ),
+    new_image: UploadFile = File(
+        ...,
+        description="Target single-manifest OCI Image Layout tar, same platform "
+        "as the old image",
+    ),
+):
+    # Same per-request scratch isolation as /unpack.
+    work = tempfile.mkdtemp(prefix="req-", dir=WORK_ROOT)
+    try:
+        old_path = os.path.join(work, "old-upload.tar")
+        new_path = os.path.join(work, "new-upload.tar")
+        for upload, dest in ((old_image, old_path), (new_image, new_path)):
+            with open(dest, "wb") as out:
+                shutil.copyfileobj(upload.file, out, CHUNK)
+        layer_tar = make_diff_layer(old_path, new_path, work)
+    except (UnpackError, DifferError) as exc:
+        shutil.rmtree(work, ignore_errors=True)
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception:
+        shutil.rmtree(work, ignore_errors=True)
+        logger.exception("unexpected error while building diff layer")
+        raise HTTPException(status_code=500, detail="internal error")
+    return FileResponse(
+        layer_tar,
+        media_type="application/x-tar",
+        filename="diff-layer.tar",
         background=BackgroundTask(partial(shutil.rmtree, work, ignore_errors=True)),
     )
